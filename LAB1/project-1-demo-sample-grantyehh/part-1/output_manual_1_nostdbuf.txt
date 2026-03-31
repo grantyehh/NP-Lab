@@ -1,0 +1,19 @@
+mysh> mysh> bin
+test.html
+mysh> execvp: No such file or directory
+mysh> mysh> bin
+test.html
+test1.txt
+test2.txt
+mysh> execvp: No such file or directory
+mysh> cat
+ls
+manyblessings
+noop
+number
+removetag
+removetag0
+wc
+mysh> Tue Mar 31 22:16:53 CST 2026
+mysh> mysh> execvp: No such file or directory
+mysh> mysh> 
