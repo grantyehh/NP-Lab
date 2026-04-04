@@ -1,11 +1,13 @@
 #include <iostream>
 #include <filesystem>
 #include <string>
+#include <unistd.h>
 
 namespace fs = std::filesystem;
 
 int main(int argc, char *argv[]) {
     std::string path = ".";
+    bool to_terminal = isatty(STDOUT_FILENO);
 
     // Find first argument that is not an option (doesn't start with '-')
     for (int i = 1; i < argc; ++i) {
@@ -21,9 +23,16 @@ int main(int argc, char *argv[]) {
 
     try {
         for (const auto &entry : fs::directory_iterator(path)) {
-            std::cout << entry.path().filename().string() << "  ";
+            std::cout << entry.path().filename().string();
+            if (to_terminal) {
+                std::cout << " ";
+            } else {
+                std::cout << "\n";
+            }
         }
-        std::cout << "\n";
+        if (to_terminal) {
+            std::cout << "\n";
+        }
     } catch (const fs::filesystem_error &e) {
         std::cerr << "ls: filesystem error: " << e.what() << "\n";
         return 1;
