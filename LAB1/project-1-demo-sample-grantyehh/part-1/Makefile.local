@@ -1,0 +1,44 @@
+.PHONY: demo-local
+
+SHELL_PATH ?= $(HOME)/Grant/Project/NP_LAB/LAB1/demo/npshell
+TEST_CASE_DIR ?= test_case
+ANSWER_DIR ?= answer
+TEST_CASE_START ?= 1
+TEST_CASE_END ?= 7
+TIMEOUT_SECS ?= 5
+
+demo-local:
+	@raw_shell_path='$(SHELL_PATH)'; \
+	shell_path=$$(printf '%s\n' "$$raw_shell_path" | sed 's|^~/|$(HOME)/|'); \
+	if [ ! -x "$$shell_path" ]; then \
+		echo "SHELL_PATH is not executable: $$shell_path"; \
+		exit 1; \
+	fi; \
+	correct_cases=""; \
+	wrong_cases=""; \
+	for i in $$(seq $(TEST_CASE_START) $(TEST_CASE_END)); do \
+		tmp_output=$$(mktemp /tmp/npshell-local-output.XXXXXX); \
+		echo "===== Test case $$i ====="; \
+		/usr/bin/perl -e 'my $$timeout = shift @ARGV; my $$pid = fork(); die "fork failed\n" unless defined $$pid; if ($$pid == 0) { exec @ARGV or exit 127; } local $$SIG{ALRM} = sub { kill 9, $$pid; waitpid($$pid, 0); exit 124; }; alarm $$timeout; waitpid($$pid, 0); my $$status = $$?; alarm 0; if ($$status & 127) { exit 128 + ($$status & 127); } exit($$status >> 8);' "$(TIMEOUT_SECS)" "$$shell_path" < "$(TEST_CASE_DIR)/$$i.txt" > "$$tmp_output" 2>&1; \
+		status=$$?; \
+		if [ "$$status" -eq 124 ]; then \
+			echo "Your answer is wrong (timeout after $(TIMEOUT_SECS)s)"; \
+			wrong_cases="$$wrong_cases $$i"; \
+			echo "--- captured output before timeout (first 120 lines) ---"; \
+			sed -n '1,120p' "$$tmp_output"; \
+			echo "--- end captured output ---"; \
+		elif diff -w "$$tmp_output" "$(ANSWER_DIR)/$$i.txt" > /dev/null; then \
+			echo "Your answer is correct"; \
+			correct_cases="$$correct_cases $$i"; \
+		else \
+			echo "Your answer is wrong"; \
+			wrong_cases="$$wrong_cases $$i"; \
+			echo "--- diff (output vs answer, first 200 lines) ---"; \
+			diff -wu "$$tmp_output" "$(ANSWER_DIR)/$$i.txt" | sed -n '1,200p' || true; \
+			echo "--- end diff ---"; \
+		fi; \
+		rm -f "$$tmp_output"; \
+	done; \
+	echo "======= Summary ======="; \
+	[ -n "$$correct_cases" ] && echo "[Correct]:$$correct_cases"; \
+	[ -n "$$wrong_cases" ] && echo "[ Wrong ]:$$wrong_cases"

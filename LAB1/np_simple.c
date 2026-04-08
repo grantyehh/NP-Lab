@@ -1,9 +1,14 @@
+#include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <netinet/in.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -14,7 +19,7 @@ extern char **environ;
 #define MAX_CMDS 4096
 #define MAX_DEFERRED 256
 
-enum { // basic is int
+enum {
     PIPE_NONE = 0,
     PIPE_ORDINARY = 1,
     PIPE_NUMBERED = 2
@@ -39,7 +44,7 @@ typedef struct {
 
 static Command command_buffer[MAX_CMDS];
 
-static int parse_line(char *line, Command commands[]) { // parse command, return how many command
+static int parse_line(char *line, Command commands[]) {
     int cmd_count = 0;
     Command current;
     char *token;
@@ -148,8 +153,7 @@ static int get_or_create_deferred_pipe(DeferredPipe deferred[], int *deferred_co
 }
 
 static void remove_deferred_pipe(DeferredPipe deferred[], int *deferred_count, int index) {
-    int i;
-    for (i = index; i + 1 < *deferred_count; ++i) {
+    for (int i = index; i + 1 < *deferred_count; ++i) {
         deferred[i] = deferred[i + 1];
     }
     (*deferred_count)--;
@@ -163,6 +167,7 @@ static void close_if_open(int fd) {
 
 static void write_all(int fd, const char *buffer, ssize_t count) {
     ssize_t written = 0;
+
     while (written < count) {
         ssize_t result = write(fd, buffer + written, (size_t)(count - written));
         if (result <= 0) {
@@ -206,23 +211,23 @@ static int count_line_segments(const Command commands[], int cmd_count) {
     return segments;
 }
 
-static void execute_commands(Command commands[], int cmd_count, DeferredPipe deferred[], // execute the bin command
+static void execute_commands(Command commands[], int cmd_count, DeferredPipe deferred[],
                              int *deferred_count, int current_line) {
     pid_t pids[MAX_CMDS * 2];
     int pid_should_wait[MAX_CMDS * 2];
     int pid_count = 0;
-    int prev_read_fd;
-    int i;
-    int last_segment_slot = current_line + count_line_segments(commands, cmd_count) - 1;
-    int should_wait_last_segment = (commands[cmd_count - 1].pipe_mode != PIPE_NUMBERED);
+    int prev_read_fd = -1;
+    int last_segment_slot;
+    int should_wait_last_segment;
 
     if (cmd_count == 0) {
         return;
     }
 
-    prev_read_fd = -1;
+    last_segment_slot = current_line + count_line_segments(commands, cmd_count) - 1;
+    should_wait_last_segment = (commands[cmd_count - 1].pipe_mode != PIPE_NUMBERED);
 
-    for (i = 0; i < cmd_count; ++i) {
+    for (int i = 0; i < cmd_count; ++i) {
         int ordinary_pipe[2] = {-1, -1};
         int next_read_fd = -1;
         int numbered_index = -1;
@@ -231,8 +236,8 @@ static void execute_commands(Command commands[], int cmd_count, DeferredPipe def
         int stdin_fd = -1;
         int merge_pipe[2] = {-1, -1};
         int has_prev_pipe_input = (prev_read_fd >= 0);
-        pid_t pid;
         int command_slot = current_line;
+        pid_t pid;
 
         if (commands[i].argc == 0 || commands[i].argv[0] == NULL) {
             close_if_open(prev_read_fd);
@@ -248,7 +253,6 @@ static void execute_commands(Command commands[], int cmd_count, DeferredPipe def
             (int)(sizeof(ready_fds) / sizeof(ready_fds[0])) - ready_count);
 
         if (commands[i].infile != NULL) {
-            stdin_fd = -1;
             for (int j = 0; j < ready_count; ++j) {
                 close_if_open(ready_fds[j]);
             }
@@ -265,6 +269,7 @@ static void execute_commands(Command commands[], int cmd_count, DeferredPipe def
                 prev_read_fd = -1;
                 break;
             }
+
             pid = fork();
             if (pid < 0) {
                 perror("fork");
@@ -277,11 +282,14 @@ static void execute_commands(Command commands[], int cmd_count, DeferredPipe def
                 prev_read_fd = -1;
                 break;
             }
+
             if (pid == 0) {
                 char buffer[4096];
+
                 close_if_open(merge_pipe[0]);
                 for (int j = 0; j < ready_count; ++j) {
                     ssize_t bytes;
+
                     while ((bytes = read(ready_fds[j], buffer, sizeof(buffer))) > 0) {
                         write_all(merge_pipe[1], buffer, bytes);
                     }
@@ -290,8 +298,10 @@ static void execute_commands(Command commands[], int cmd_count, DeferredPipe def
                 close_if_open(merge_pipe[1]);
                 exit(0);
             }
+
             pids[pid_count++] = pid;
-            pid_should_wait[pid_count - 1] = should_wait_last_segment && (command_slot == last_segment_slot);
+            pid_should_wait[pid_count - 1] =
+                should_wait_last_segment && (command_slot == last_segment_slot);
             for (int j = 0; j < ready_count; ++j) {
                 close_if_open(ready_fds[j]);
             }
@@ -384,7 +394,8 @@ static void execute_commands(Command commands[], int cmd_count, DeferredPipe def
         pid_should_wait[pid_count - 1] =
             should_wait_last_segment &&
             (command_slot == last_segment_slot ||
-             (commands[i].pipe_mode == PIPE_NUMBERED && command_slot + commands[i].pipe_num == last_segment_slot));
+             (commands[i].pipe_mode == PIPE_NUMBERED &&
+              command_slot + commands[i].pipe_num == last_segment_slot));
         close_if_open(stdin_fd);
         prev_read_fd = next_read_fd;
 
@@ -404,14 +415,15 @@ static void execute_commands(Command commands[], int cmd_count, DeferredPipe def
     close_if_open(prev_read_fd);
 
     if (should_wait_last_segment) {
-        for (i = 0; i < pid_count; ++i) {
+        for (int i = 0; i < pid_count; ++i) {
             if (pid_should_wait[i]) {
                 waitpid(pids[i], NULL, 0);
             }
         }
     } else {
-        for (i = 0; i < pid_count; ++i) {
+        for (int i = 0; i < pid_count; ++i) {
             int status;
+
             if (waitpid(pids[i], &status, WNOHANG) == 0) {
                 continue;
             }
@@ -422,14 +434,16 @@ static void execute_commands(Command commands[], int cmd_count, DeferredPipe def
     }
 }
 
-int main(void) {
+static void run_shell_session(void) {
     char line[MAX_LINE];
-    char original_line[MAX_LINE];
     DeferredPipe deferred[MAX_DEFERRED];
     int deferred_count = 0;
     int current_slot = 1;
 
+    memset(deferred, 0, sizeof(deferred));
     setenv("PATH", "bin:.", 1);
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
 
     while (1) {
         int cmd_count;
@@ -438,17 +452,13 @@ int main(void) {
         fflush(stdout);
 
         if (fgets(line, MAX_LINE, stdin) == NULL) {
-            printf("\n");
             break;
         }
 
-        line[strcspn(line, "\n")] = '\0';
+        line[strcspn(line, "\r\n")] = '\0';
         if (line[0] == '\0') {
             continue;
         }
-
-        strncpy(original_line, line, sizeof(original_line) - 1);
-        original_line[sizeof(original_line) - 1] = '\0';
 
         cmd_count = parse_line(line, command_buffer);
         if (cmd_count == 0 || command_buffer[0].argc == 0 || command_buffer[0].argv[0] == NULL) {
@@ -462,12 +472,13 @@ int main(void) {
         if (strcmp(command_buffer[0].argv[0], "cd") == 0 && cmd_count == 1) {
             if (command_buffer[0].argv[1] == NULL) {
                 char *home = getenv("HOME");
+
                 if (home == NULL) {
                     fprintf(stderr, "cd: HOME not set\n");
                 } else if (chdir(home) != 0) {
                     perror("cd");
                 }
-                } else if (chdir(command_buffer[0].argv[1]) != 0) {
+            } else if (chdir(command_buffer[0].argv[1]) != 0) {
                 perror("cd");
             }
             current_slot += count_line_segments(command_buffer, cmd_count);
@@ -482,8 +493,10 @@ int main(void) {
             } else {
                 for (int i = 1; i < command_buffer[0].argc; ++i) {
                     size_t len = strlen(command_buffer[0].argv[i]);
+
                     for (char **env = environ; *env != NULL; ++env) {
-                        if (strncmp(*env, command_buffer[0].argv[i], len) == 0 && (*env)[len] == '=') {
+                        if (strncmp(*env, command_buffer[0].argv[i], len) == 0 &&
+                            (*env)[len] == '=') {
                             printf("%s\n", *env + len + 1);
                             break;
                         }
@@ -504,7 +517,6 @@ int main(void) {
             continue;
         }
 
-        (void)original_line;
         execute_commands(command_buffer, cmd_count, deferred, &deferred_count, current_slot);
         current_slot += count_line_segments(command_buffer, cmd_count);
     }
@@ -513,6 +525,114 @@ int main(void) {
         close_if_open(deferred[i].read_fd);
         close_if_open(deferred[i].write_fd);
     }
+}
 
-    return 0;
+static void reap_children(int signo) {
+    (void)signo;
+    while (waitpid(-1, NULL, WNOHANG) > 0) {
+    }
+}
+
+static int create_server_socket(unsigned short port) {
+    int listen_fd;
+    int enable = 1;
+    struct sockaddr_in server_addr;
+
+    listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd < 0) {
+        perror("socket");
+        return -1;
+    }
+
+    if (setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(enable)) < 0) {
+        perror("setsockopt");
+        close(listen_fd);
+        return -1;
+    }
+
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    server_addr.sin_port = htons(port);
+
+    if (bind(listen_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        perror("bind");
+        close(listen_fd);
+        return -1;
+    }
+
+    if (listen(listen_fd, SOMAXCONN) < 0) {
+        perror("listen");
+        close(listen_fd);
+        return -1;
+    }
+
+    return listen_fd;
+}
+
+int main(int argc, char *argv[]) {
+    int listen_fd;
+    struct sigaction sa;
+    unsigned short port;
+
+    if (argc != 2) {
+        fprintf(stderr, "Usage: %s <port>\n", argv[0]);
+        return 1;
+    }
+
+    port = (unsigned short)atoi(argv[1]);
+    if (port == 0) {
+        fprintf(stderr, "Invalid port: %s\n", argv[1]);
+        return 1;
+    }
+
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = reap_children;
+    sa.sa_flags = SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGCHLD, &sa, NULL) < 0) {
+        perror("sigaction");
+        return 1;
+    }
+
+    signal(SIGPIPE, SIG_IGN);
+
+    listen_fd = create_server_socket(port);
+    if (listen_fd < 0) {
+        return 1;
+    }
+
+    while (1) {
+        int conn_fd;
+        pid_t pid;
+
+        conn_fd = accept(listen_fd, NULL, NULL);
+        if (conn_fd < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            perror("accept");
+            continue;
+        }
+
+        pid = fork();
+        if (pid < 0) {
+            perror("fork");
+            close(conn_fd);
+            continue;
+        }
+
+        if (pid == 0) {
+            close(listen_fd);
+            signal(SIGCHLD, SIG_DFL);
+            dup2(conn_fd, STDIN_FILENO);
+            dup2(conn_fd, STDOUT_FILENO);
+            dup2(conn_fd, STDERR_FILENO);
+            close(conn_fd);
+            run_shell_session();
+            exit(0);
+        }
+
+        close(conn_fd);
+    }
 }
