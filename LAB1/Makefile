@@ -1,9 +1,24 @@
 CC = clang
 CFLAGS = -Wall -Wextra -pedantic -std=c11
 
-.PHONY: all clean
+ROOT := $(CURDIR)
+PART1_DIR := $(ROOT)/project-1-demo-sample-grantyehh/part-1
+PART2_DIR := $(ROOT)/project-1-demo-sample-grantyehh/part-2
+PART2_PORT ?= 12345
 
-all: npshell np_simple
+.PHONY: all build test test1 test2 clean
+
+all: build test
+
+build: npshell np_simple
+
+test: test1 test2
+
+test1: build
+	cd $(PART1_DIR) && ./demo.sh $(ROOT)/npshell
+
+test2: build
+	cd $(PART2_DIR) && ./demo.sh $(ROOT)/np_simple $(PART2_PORT)
 
 npshell: npshell.c
 	$(CC) $(CFLAGS) $< -o $@
