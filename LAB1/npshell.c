@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -13,6 +14,10 @@ extern char **environ;
 #define MAX_ARGS 256
 #define MAX_CMDS 4096
 #define MAX_DEFERRED 256
+#define DEFAULT_BATCH_THRESHOLD 128
+#define DEFAULT_BATCH_SIZE 32
+#define MIN_BATCH_THRESHOLD 32
+#define MAX_RELAY_BYTES (16 * 1024 * 1024)
 
 enum { // basic is int
     PIPE_NONE = 0,
@@ -36,6 +41,12 @@ typedef struct {
     int read_fd;
     int write_fd;
 } DeferredPipe;
+
+typedef struct {
+    char *data;
+    size_t len;
+    size_t cap;
+} ByteBuffer;
 
 static Command command_buffer[MAX_CMDS];
 
@@ -204,6 +215,310 @@ static int count_line_segments(const Command commands[], int cmd_count) {
     }
 
     return segments;
+}
+
+static int is_builtin_name(const char *name) {
+    return strcmp(name, "exit") == 0 || strcmp(name, "cd") == 0 || strcmp(name, "setenv") == 0 ||
+           strcmp(name, "printenv") == 0;
+}
+
+static int parse_positive_env(const char *name, int fallback) {
+    char *value = getenv(name);
+    char *end = NULL;
+    long parsed;
+
+    if (value == NULL || *value == '\0') {
+        return fallback;
+    }
+
+    parsed = strtol(value, &end, 10);
+    if (end == value || *end != '\0' || parsed <= 0 || parsed > 1000000L) {
+        return fallback;
+    }
+
+    return (int)parsed;
+}
+
+static int get_fallback_threshold(void) {
+    struct rlimit limit;
+    int threshold = DEFAULT_BATCH_THRESHOLD;
+
+    if (getrlimit(RLIMIT_NPROC, &limit) == 0 && limit.rlim_cur != RLIM_INFINITY) {
+        int current_limit = (int)limit.rlim_cur;
+        int half = current_limit / 2;
+        int minus_margin = current_limit - 32;
+
+        threshold = (half < minus_margin) ? half : minus_margin;
+        if (threshold < MIN_BATCH_THRESHOLD) {
+            threshold = MIN_BATCH_THRESHOLD;
+        }
+    }
+
+    return parse_positive_env("NP_PIPE_BATCH_THRESHOLD", threshold);
+}
+
+static int get_batch_size(void) {
+    return parse_positive_env("NP_PIPE_BATCH_SIZE", DEFAULT_BATCH_SIZE);
+}
+
+static int should_use_batched_pipeline(const Command commands[], int cmd_count) {
+    int threshold = get_fallback_threshold();
+
+    if (cmd_count <= threshold) {
+        return 0;
+    }
+
+    for (int i = 0; i < cmd_count; ++i) {
+        const Command *command = &commands[i];
+        int is_last = (i == cmd_count - 1);
+
+        if (command->argc == 0 || command->argv[0] == NULL) {
+            return 0;
+        }
+        if (command->infile != NULL || command->outfile != NULL || command->append ||
+            command->pipe_stderr || is_builtin_name(command->argv[0])) {
+            return 0;
+        }
+        if (!is_last && command->pipe_mode != PIPE_ORDINARY) {
+            return 0;
+        }
+        if (is_last && command->pipe_mode != PIPE_NONE) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+static void free_buffer(ByteBuffer *buffer) {
+    free(buffer->data);
+    buffer->data = NULL;
+    buffer->len = 0;
+    buffer->cap = 0;
+}
+
+static int ensure_buffer_capacity(ByteBuffer *buffer, size_t needed) {
+    char *new_data;
+    size_t new_cap;
+
+    if (needed <= buffer->cap) {
+        return 0;
+    }
+    if (needed > MAX_RELAY_BYTES) {
+        fprintf(stderr, "batched pipeline buffer exceeded limit\n");
+        return -1;
+    }
+
+    new_cap = (buffer->cap == 0) ? 4096 : buffer->cap;
+    while (new_cap < needed) {
+        if (new_cap >= MAX_RELAY_BYTES / 2) {
+            new_cap = MAX_RELAY_BYTES;
+            break;
+        }
+        new_cap *= 2;
+    }
+
+    new_data = realloc(buffer->data, new_cap);
+    if (new_data == NULL) {
+        perror("realloc");
+        return -1;
+    }
+
+    buffer->data = new_data;
+    buffer->cap = new_cap;
+    return 0;
+}
+
+static int append_buffer(ByteBuffer *buffer, const char *data, size_t len) {
+    if (len == 0) {
+        return 0;
+    }
+    if (ensure_buffer_capacity(buffer, buffer->len + len) != 0) {
+        return -1;
+    }
+
+    memcpy(buffer->data + buffer->len, data, len);
+    buffer->len += len;
+    return 0;
+}
+
+static int read_fd_to_buffer(int fd, ByteBuffer *buffer) {
+    char chunk[4096];
+    ssize_t bytes;
+
+    buffer->len = 0;
+    while ((bytes = read(fd, chunk, sizeof(chunk))) > 0) {
+        if (append_buffer(buffer, chunk, (size_t)bytes) != 0) {
+            return -1;
+        }
+    }
+
+    if (bytes < 0) {
+        perror("read");
+        return -1;
+    }
+
+    return 0;
+}
+
+static int run_pipeline_batch(Command commands[], int start, int end, const ByteBuffer *input,
+                              ByteBuffer *output) {
+    pid_t pids[MAX_CMDS];
+    int pid_count = 0;
+    int prev_read_fd = -1;
+    int input_pipe[2] = {-1, -1};
+    int capture_pipe[2] = {-1, -1};
+    int use_input_pipe = (input != NULL);
+
+    output->len = 0;
+
+    if (use_input_pipe && pipe(input_pipe) < 0) {
+        perror("pipe");
+        return -1;
+    }
+    if (pipe(capture_pipe) < 0) {
+        perror("pipe");
+        close_if_open(input_pipe[0]);
+        close_if_open(input_pipe[1]);
+        return -1;
+    }
+
+    prev_read_fd = use_input_pipe ? input_pipe[0] : -1;
+
+    for (int i = start; i < end; ++i) {
+        int ordinary_pipe[2] = {-1, -1};
+        int next_read_fd = -1;
+        int stdin_fd = prev_read_fd;
+        int is_last = (i == end - 1);
+        pid_t pid;
+
+        if (!is_last && pipe(ordinary_pipe) < 0) {
+            perror("pipe");
+            close_if_open(prev_read_fd);
+            close_if_open(capture_pipe[0]);
+            close_if_open(capture_pipe[1]);
+            close_if_open(input_pipe[0]);
+            close_if_open(input_pipe[1]);
+            return -1;
+        }
+
+        if (!is_last) {
+            next_read_fd = ordinary_pipe[0];
+        }
+
+        pid = fork();
+        if (pid < 0) {
+            perror("fork");
+            close_if_open(stdin_fd);
+            close_if_open(ordinary_pipe[0]);
+            close_if_open(ordinary_pipe[1]);
+            close_if_open(capture_pipe[0]);
+            close_if_open(capture_pipe[1]);
+            close_if_open(input_pipe[1]);
+            for (int j = 0; j < pid_count; ++j) {
+                waitpid(pids[j], NULL, 0);
+            }
+            return -1;
+        }
+
+        if (pid == 0) {
+            if (stdin_fd >= 0) {
+                dup2(stdin_fd, STDIN_FILENO);
+            }
+
+            if (is_last) {
+                dup2(capture_pipe[1], STDOUT_FILENO);
+            } else {
+                dup2(ordinary_pipe[1], STDOUT_FILENO);
+            }
+
+            close_if_open(stdin_fd);
+            close_if_open(ordinary_pipe[0]);
+            close_if_open(ordinary_pipe[1]);
+            close_if_open(capture_pipe[0]);
+            close_if_open(capture_pipe[1]);
+            close_if_open(input_pipe[0]);
+            close_if_open(input_pipe[1]);
+
+            execvp(commands[i].argv[0], commands[i].argv);
+            if (errno == ENOENT) {
+                fprintf(stderr, "Unknown command: [%s].\n", commands[i].argv[0]);
+            } else {
+                perror("execvp");
+            }
+            exit(1);
+        }
+
+        pids[pid_count++] = pid;
+        close_if_open(stdin_fd);
+        if (!is_last) {
+            close_if_open(ordinary_pipe[1]);
+        }
+        prev_read_fd = next_read_fd;
+    }
+
+    close_if_open(prev_read_fd);
+    close_if_open(capture_pipe[1]);
+    close_if_open(input_pipe[0]);
+
+    if (use_input_pipe) {
+        if (input->len > 0) {
+            write_all(input_pipe[1], input->data, (ssize_t)input->len);
+        }
+        close_if_open(input_pipe[1]);
+    }
+
+    if (read_fd_to_buffer(capture_pipe[0], output) != 0) {
+        close_if_open(capture_pipe[0]);
+        for (int i = 0; i < pid_count; ++i) {
+            waitpid(pids[i], NULL, 0);
+        }
+        return -1;
+    }
+
+    close_if_open(capture_pipe[0]);
+
+    for (int i = 0; i < pid_count; ++i) {
+        waitpid(pids[i], NULL, 0);
+    }
+
+    return 0;
+}
+
+static int execute_commands_batched(Command commands[], int cmd_count) {
+    ByteBuffer current = {0};
+    ByteBuffer next = {0};
+    const ByteBuffer *input = NULL;
+    int batch_size = get_batch_size();
+    int start = 0;
+
+    while (start < cmd_count) {
+        int end = start + batch_size;
+
+        if (end > cmd_count) {
+            end = cmd_count;
+        }
+
+        if (run_pipeline_batch(commands, start, end, input, &next) != 0) {
+            free_buffer(&current);
+            free_buffer(&next);
+            return -1;
+        }
+
+        free_buffer(&current);
+        current = next;
+        next.data = NULL;
+        next.len = 0;
+        next.cap = 0;
+        input = &current;
+        start = end;
+    }
+
+    if (current.len > 0) {
+        write_all(STDOUT_FILENO, current.data, (ssize_t)current.len);
+    }
+    free_buffer(&current);
+    return 0;
 }
 
 static void execute_commands(Command commands[], int cmd_count, DeferredPipe deferred[], // execute the bin command
@@ -505,7 +820,13 @@ int main(void) {
         }
 
         (void)original_line;
-        execute_commands(command_buffer, cmd_count, deferred, &deferred_count, current_slot);
+        if (should_use_batched_pipeline(command_buffer, cmd_count)) {
+            if (execute_commands_batched(command_buffer, cmd_count) != 0) {
+                fprintf(stderr, "batched pipeline execution failed\n");
+            }
+        } else {
+            execute_commands(command_buffer, cmd_count, deferred, &deferred_count, current_slot);
+        }
         current_slot += count_line_segments(command_buffer, cmd_count);
     }
 
