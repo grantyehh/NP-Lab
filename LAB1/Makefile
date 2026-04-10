@@ -1,5 +1,5 @@
-CC = clang
-CFLAGS = -Wall -Wextra -pedantic -std=c11
+CC ?= cc
+CFLAGS = -Wall -Wextra -pedantic -std=c11 -D_POSIX_C_SOURCE=200809L
 
 ROOT := $(CURDIR)
 PART1_DIR := $(ROOT)/project-1-demo-sample-grantyehh/part-1

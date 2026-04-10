@@ -36,3 +36,8 @@ done
 echo "[1;34m======= Summary =======[m"
 [ -n "${correct_cases}" ] && echo "[0;32m[Correct][m:${correct_cases}"
 [ -n "${wrong_cases}" ] && echo "[0;31m[ Wrong ][m:${wrong_cases}"
+
+if [ -n "${wrong_cases}" ]; then
+  exit 1
+fi
+exit 0
