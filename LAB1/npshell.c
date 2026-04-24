@@ -48,7 +48,15 @@ typedef struct {
     size_t cap;
 } ByteBuffer;
 
+typedef struct {
+    DeferredPipe deferred[MAX_DEFERRED];
+    int deferred_count;
+    int current_slot;
+} ShellState;
+
 static Command command_buffer[MAX_CMDS];
+static void execute_commands(Command commands[], int cmd_count, DeferredPipe deferred[],
+                             int *deferred_count, int current_line);
 
 static int parse_line(char *line, Command commands[]) { // parse command, return how many command
     int cmd_count = 0;
@@ -219,7 +227,7 @@ static int count_line_segments(const Command commands[], int cmd_count) {
 
 static int is_builtin_name(const char *name) {
     return strcmp(name, "exit") == 0 || strcmp(name, "cd") == 0 || strcmp(name, "setenv") == 0 ||
-           strcmp(name, "printenv") == 0;
+           strcmp(name, "printenv") == 0 || strcmp(name, "source") == 0;
 }
 
 static int parse_positive_env(const char *name, int fallback) {
@@ -521,6 +529,113 @@ static int execute_commands_batched(Command commands[], int cmd_count) {
     return 0;
 }
 
+static int run_script_file(const char *path, ShellState *state);
+
+static int process_command_line(char *line, ShellState *state) {
+    int cmd_count;
+
+    line[strcspn(line, "\r\n")] = '\0';
+    if (line[0] == '\0') {
+        return 0;
+    }
+
+    cmd_count = parse_line(line, command_buffer);
+    if (cmd_count == 0 || command_buffer[0].argc == 0 || command_buffer[0].argv[0] == NULL) {
+        return 0;
+    }
+
+    if (strcmp(command_buffer[0].argv[0], "exit") == 0 && cmd_count == 1) {
+        return 1;
+    }
+
+    if (strcmp(command_buffer[0].argv[0], "cd") == 0 && cmd_count == 1) {
+        if (command_buffer[0].argv[1] == NULL) {
+            char *home = getenv("HOME");
+            if (home == NULL) {
+                fprintf(stderr, "cd: HOME not set\n");
+            } else if (chdir(home) != 0) {
+                perror("cd");
+            }
+        } else if (chdir(command_buffer[0].argv[1]) != 0) {
+            perror("cd");
+        }
+        state->current_slot += count_line_segments(command_buffer, cmd_count);
+        return 0;
+    }
+
+    if (strcmp(command_buffer[0].argv[0], "printenv") == 0 && cmd_count == 1) {
+        if (command_buffer[0].argc == 1) {
+            for (char **env = environ; *env != NULL; ++env) {
+                printf("%s\n", *env);
+            }
+        } else {
+            for (int i = 1; i < command_buffer[0].argc; ++i) {
+                size_t len = strlen(command_buffer[0].argv[i]);
+                for (char **env = environ; *env != NULL; ++env) {
+                    if (strncmp(*env, command_buffer[0].argv[i], len) == 0 && (*env)[len] == '=') {
+                        printf("%s\n", *env + len + 1);
+                        break;
+                    }
+                }
+            }
+        }
+        state->current_slot += count_line_segments(command_buffer, cmd_count);
+        return 0;
+    }
+
+    if (strcmp(command_buffer[0].argv[0], "setenv") == 0 && cmd_count == 1) {
+        if (command_buffer[0].argc < 3) {
+            fprintf(stderr, "Usage: setenv VAR VALUE\n");
+        } else if (setenv(command_buffer[0].argv[1], command_buffer[0].argv[2], 1) != 0) {
+            perror("setenv");
+        }
+        state->current_slot += count_line_segments(command_buffer, cmd_count);
+        return 0;
+    }
+
+    if (strcmp(command_buffer[0].argv[0], "source") == 0 && cmd_count == 1) {
+        int should_exit = 0;
+
+        if (command_buffer[0].argc < 2) {
+            fprintf(stderr, "Usage: source FILE\n");
+        } else {
+            should_exit = run_script_file(command_buffer[0].argv[1], state);
+        }
+        state->current_slot += count_line_segments(command_buffer, cmd_count);
+        return should_exit;
+    }
+
+    if (should_use_batched_pipeline(command_buffer, cmd_count)) {
+        if (execute_commands_batched(command_buffer, cmd_count) != 0) {
+            fprintf(stderr, "batched pipeline execution failed\n");
+        }
+    } else {
+        execute_commands(command_buffer, cmd_count, state->deferred, &state->deferred_count, state->current_slot);
+    }
+    state->current_slot += count_line_segments(command_buffer, cmd_count);
+    return 0;
+}
+
+static int run_script_file(const char *path, ShellState *state) {
+    FILE *file = fopen(path, "r");
+    char line[MAX_LINE];
+
+    if (file == NULL) {
+        perror("source");
+        return 0;
+    }
+
+    while (fgets(line, sizeof(line), file) != NULL) {
+        if (process_command_line(line, state)) {
+            fclose(file);
+            return 1;
+        }
+    }
+
+    fclose(file);
+    return 0;
+}
+
 static void execute_commands(Command commands[], int cmd_count, DeferredPipe deferred[], // execute the bin command
                              int *deferred_count, int current_line) {
     pid_t pids[MAX_CMDS * 2];
@@ -739,16 +854,13 @@ static void execute_commands(Command commands[], int cmd_count, DeferredPipe def
 
 int main(void) {
     char line[MAX_LINE];
-    char original_line[MAX_LINE];
-    DeferredPipe deferred[MAX_DEFERRED];
-    int deferred_count = 0;
-    int current_slot = 1;
+    ShellState state;
 
+    memset(&state, 0, sizeof(state));
+    state.current_slot = 1;
     setenv("PATH", "bin:.", 1);
 
     while (1) {
-        int cmd_count;
-
         printf("%% ");
         fflush(stdout);
 
@@ -756,83 +868,14 @@ int main(void) {
             printf("\n");
             break;
         }
-
-        line[strcspn(line, "\n")] = '\0';
-        if (line[0] == '\0') {
-            continue;
-        }
-
-        strncpy(original_line, line, sizeof(original_line) - 1);
-        original_line[sizeof(original_line) - 1] = '\0';
-
-        cmd_count = parse_line(line, command_buffer);
-        if (cmd_count == 0 || command_buffer[0].argc == 0 || command_buffer[0].argv[0] == NULL) {
-            continue;
-        }
-
-        if (strcmp(command_buffer[0].argv[0], "exit") == 0 && cmd_count == 1) {
+        if (process_command_line(line, &state)) {
             break;
         }
-
-        if (strcmp(command_buffer[0].argv[0], "cd") == 0 && cmd_count == 1) {
-            if (command_buffer[0].argv[1] == NULL) {
-                char *home = getenv("HOME");
-                if (home == NULL) {
-                    fprintf(stderr, "cd: HOME not set\n");
-                } else if (chdir(home) != 0) {
-                    perror("cd");
-                }
-                } else if (chdir(command_buffer[0].argv[1]) != 0) {
-                perror("cd");
-            }
-            current_slot += count_line_segments(command_buffer, cmd_count);
-            continue;
-        }
-
-        if (strcmp(command_buffer[0].argv[0], "printenv") == 0 && cmd_count == 1) {
-            if (command_buffer[0].argc == 1) {
-                for (char **env = environ; *env != NULL; ++env) {
-                    printf("%s\n", *env);
-                }
-            } else {
-                for (int i = 1; i < command_buffer[0].argc; ++i) {
-                    size_t len = strlen(command_buffer[0].argv[i]);
-                    for (char **env = environ; *env != NULL; ++env) {
-                        if (strncmp(*env, command_buffer[0].argv[i], len) == 0 && (*env)[len] == '=') {
-                            printf("%s\n", *env + len + 1);
-                            break;
-                        }
-                    }
-                }
-            }
-            current_slot += count_line_segments(command_buffer, cmd_count);
-            continue;
-        }
-
-        if (strcmp(command_buffer[0].argv[0], "setenv") == 0 && cmd_count == 1) {
-            if (command_buffer[0].argc < 3) {
-                fprintf(stderr, "Usage: setenv VAR VALUE\n");
-            } else if (setenv(command_buffer[0].argv[1], command_buffer[0].argv[2], 1) != 0) {
-                perror("setenv");
-            }
-            current_slot += count_line_segments(command_buffer, cmd_count);
-            continue;
-        }
-
-        (void)original_line;
-        if (should_use_batched_pipeline(command_buffer, cmd_count)) {
-            if (execute_commands_batched(command_buffer, cmd_count) != 0) {
-                fprintf(stderr, "batched pipeline execution failed\n");
-            }
-        } else {
-            execute_commands(command_buffer, cmd_count, deferred, &deferred_count, current_slot);
-        }
-        current_slot += count_line_segments(command_buffer, cmd_count);
     }
 
-    for (int i = 0; i < deferred_count; ++i) {
-        close_if_open(deferred[i].read_fd);
-        close_if_open(deferred[i].write_fd);
+    for (int i = 0; i < state.deferred_count; ++i) {
+        close_if_open(state.deferred[i].read_fd);
+        close_if_open(state.deferred[i].write_fd);
     }
 
     return 0;
